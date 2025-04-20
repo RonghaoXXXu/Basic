@@ -665,8 +665,8 @@ class LL_DDM(nn.Module):
                 save_pred_img = cv2.cvtColor(save_pred_img.transpose(1, 2, 0), cv2.COLOR_BGR2RGB)
 
                 # 保存/记录图像（每20个batch保存一次）
-                if not self.configs.DEBUG and i % 20 == 0:
-                    cv2.imwrite(os.path.join(image_folder, f"{step}_{i}_{b}.png"), save_pred_img)
+                # if not self.configs.DEBUG and i % 20 == 0:
+                #     cv2.imwrite(os.path.join(image_folder, f"{step}_{i}_{b}.png"), save_pred_img)
                 
                 if self.configs.wandb.is_use_wandb and i % 20 == 0:
                     wandb.log({
