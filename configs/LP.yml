@@ -1,0 +1,77 @@
+work_name: Diffusion_LP_Deblur
+model_name: LL_DDM
+
+data:
+    type: IRdataset
+
+    train_dataset: LOLv1
+    val_dataset: LOLv1
+    
+    # patch_size: 256
+    channels: 3
+    num_workers: 2
+
+    name: GoPro_crop256
+    train:
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop256/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop256/target
+    val:
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/target
+
+    # LLdataset
+    # data_dir: /datasata/lxn/LowLight/LOL/LOLdataset/our485 # "our485"
+    ckpt_dir: /datadisk2/xuronghao/Projects/Diffusion-Low-Light-main/llckpt
+    conditional: True
+
+LP:
+    num_high: 2
+    # Low-light，hdr：6
+    in_chans: 3
+
+model:
+    in_channels: 3
+    out_ch: 3
+    ch: 64
+    ch_mult: [1, 2, 3, 4]
+    num_res_blocks: 2
+    dropout: 0.0
+    ema_rate: 0.999
+    ema: True
+    resamp_with_conv: True
+
+diffusion:
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.02
+    num_diffusion_timesteps: 200
+
+training:
+    batch_size: 4 # 4-512-OOM
+    val_batch_size: 2
+    n_epochs: 500
+    log_freq: 100
+    validation_freq: 1000
+
+optim:
+    weight_decay: 0.000
+    optimizer: Adam
+    lr: 0.0001
+    amsgrad: False
+    eps: 0.00000001
+    step_size: 50
+    gamma: 0.8
+
+
+DEBUG: False #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件
+
+wandb:
+    is_use_wandb: True
+    APIkeys: a887abe896653dfe4d9247ad2a5f5717734c0e11
+    # team
+    entity: DiffLLIR
+    # dir_root: /datadisk2/xuronghao/Projects/Diffusion-Low-Light-main/wandb
+    # User
+    ### entity
+    ###### project
+    ######## name

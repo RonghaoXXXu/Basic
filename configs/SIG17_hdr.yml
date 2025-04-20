@@ -1,0 +1,71 @@
+work_name: Diffusion_HDR
+model_name: HDR_DDM
+data:
+    ckpt_dir: /datasata/xuronghao/coding/Diffusion-Low-Light-main/hdrckpt
+    conditional: True
+
+    type: SIG17
+    num_workers: 2
+    train:
+        root_dir: /datasata/lxn/HDR/data
+        sub_set: newest_sig17_training_crop256_stride128 #newest_sig17_training_crop128_stride64
+    val:
+        root_dir: /datasata/lxn/HDR/data
+        crop: False
+        crop_size: 512
+
+hdrvit:
+    in_chans: 6
+    out_chans: 3
+    embed_dim: 60
+
+model:
+    in_channels: 3
+    out_ch: 3
+    ch: 64
+    ch_mult: [1, 2, 3, 4]
+    num_res_blocks: 2
+    dropout: 0.0
+    ema_rate: 0.999
+    ema: True
+    resamp_with_conv: True
+
+diffusion:
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.02
+    num_diffusion_timesteps: 200
+
+training:
+    batch_size: 4 #4-256-100step-2min #8-256-OOM #16-128-100step-4min #32-128-OOM
+    n_epochs: 500
+    log_freq: 50 #100
+    validation_freq: 1000 #1000
+
+optim:
+    optimizer: Adam
+    weight_decay: 0.000
+    lr: 0.0001
+    amsgrad: False
+    eps: 0.00000001
+    step_size: 50
+    gamma: 0.8
+
+DEBUG: False #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件
+
+wandb:
+    # a887abe896653dfe4d9247ad2a5f5717734c0e11
+    APIkeys: a887abe896653dfe4d9247ad2a5f5717734c0e11
+    is_use_wandb: True
+    entity: Diff
+
+# torch.save({
+    #'step': self.step,
+    #'epoch': epoch + 1,
+#    'state_dict': self.model.module.state_dict(),  # 保存 .module 的状态字典
+    #'optimizer': self.optimizer.state_dict(),
+    #'scheduler': self.scheduler.state_dict(),
+    #'ema_helper': self.ema_helper.state_dict(),
+#    'param': self.args,
+#    'config': self.configs
+#    }, save_file_path)
