@@ -1,5 +1,5 @@
 work_name: Diffusion_LP_Deblur
-model_name: LP_DDM
+model_name: LL_DDM
 
 data:
     type: IRdataset
@@ -13,11 +13,11 @@ data:
 
     name: GoPro_crop256
     train:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop128/input
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop128/target
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop256/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop256/target
     val:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test_crop128/input
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test_crop128/target
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/target
 
     # LLdataset
     # data_dir: /datasata/lxn/LowLight/LOL/LOLdataset/our485 # "our485"
@@ -50,7 +50,7 @@ training:
     batch_size: 4 # 4-512-OOM
     val_batch_size: 2
     n_epochs: 500
-    log_freq: 50
+    log_freq: 100
     validation_freq: 1000
 
 optim:

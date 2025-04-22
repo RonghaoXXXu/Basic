@@ -19,13 +19,8 @@ class IRdataset:
         #                                 patch_size=self.config.data.patch_size,
         #                                 filelist='{}_val.txt'.format(self.config.data.val_dataset), train=False)
 
-        train_dataset = AllWeatherDataset(self.config.data.data_dir,
-                                        patch_size=self.config.data.patch_size,
-                                        filelist='{}_train.txt'.format(self.config.data.train_dataset))
-
-        val_dataset = AllWeatherDataset(self.config.data.data_dir,
-                                        patch_size=self.config.data.patch_size,
-                                        filelist='{}_val.txt'.format(self.config.data.val_dataset), train=False)
+        train_dataset = AllWeatherDataset(self.config.data.train, Training=True)
+        val_dataset = AllWeatherDataset(self.config.data.val, Training=False)
 
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.config.training.batch_size,
                                                    shuffle=True, num_workers=self.config.data.num_workers,
