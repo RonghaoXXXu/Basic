@@ -3,6 +3,16 @@
 <h4 align="center">1.Sichuan University, 2.Megvii Technology, 
 <h4 align="center">3.University of Electronic Science and Technology of China</center></center>
 
+
+## model variants 
+| 算法名称          | 描述                                                                                     |
+|-------------------|------------------------------------------------------------------------------------------|
+| DenoisingDiffusion  | 原算法              |
+| HDR_DDM             | 原算法，用于HDR重建任务，噪声估计的地方条件输入是三张图，算法不变，单张卡运行                 |
+| LL_DDM              | 【DDP】Moving Debluring任务，拉普拉斯分解两层金字塔，在高频上扩散，最后与低频上采样恢复图像。        |
+| LP_DDM              | 【DDP】拉普拉斯分解一层金字塔，在高频上扩散，最后与低频卷积后的结果相加恢复图像。                              |
+
+
 ## Pipeline
 ![](./Figures/pipeline.png)
 
