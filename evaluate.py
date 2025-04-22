@@ -5,7 +5,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import numpy as np
 import datasets
-from models import DenoisingDiffusion, DiffusiveRestoration
+import models
 
 
 def parse_args_and_config():
@@ -18,11 +18,11 @@ def parse_args_and_config():
                         help="Number of implicit sampling steps")
     parser.add_argument("--image_folder", default='results/test', type=str,
                         help="Location to save restored images")
-    parser.add_argument('--seed', default=230, type=int, metavar='N',
+    parser.add_argument('--seed', default=2025, type=int, metavar='N',
                         help='Seed for initializing training (default: 230)')
     args = parser.parse_args()
 
-    with open(os.path.join("configs", args.config), "r") as f:
+    with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     new_config = dict2namespace(config)
 
@@ -44,7 +44,7 @@ def main():
     args, config = parse_args_and_config()
 
     # setup device to run
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     print("Using device: {}".format(device))
     config.device = device
 
@@ -59,15 +59,14 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     # data loading
-    print("=> using dataset '{}'".format(config.data.val_dataset))
+    print("=> using dataset {}".format(config.data.name))
     DATASET = datasets.__dict__[config.data.type](config)
-    _, val_loader = DATASET.get_loaders(parse_patches=False)
+    _, val_loader = DATASET.get_loaders()
 
     # create model
     print("=> creating denoising-diffusion model")
-    diffusion = DenoisingDiffusion(args, config)
-    model = DiffusiveRestoration(diffusion, args, config)
-    model.restore(val_loader)
+    diffusion = models.__dict__[config.model_name](config, args, ddp=False)
+    diffusion.restor(val_loader, config.device, resume=args.resume)
 
 
 if __name__ == '__main__':

@@ -402,14 +402,15 @@ class Net(nn.Module):
         return data_dict
     
 class LP_DDM(nn.Module):
-    def __init__(self, configs, args):
+    def __init__(self, configs, args, ddp=True):
         super().__init__()
         self.configs = configs
         self.args = args
         self.model = Net(config=configs, args=args)
-        self.model = DDP(self.model.to(self.args.gpu), 
-                         device_ids=[self.args.gpu],
-                         find_unused_parameters=True)
+        if ddp:
+            self.model = DDP(self.model.to(self.args.gpu), 
+                            device_ids=[self.args.gpu],
+                            find_unused_parameters=True)
         self.ema_helper = EMAHelper()
         self.ema_helper.register(self.model)
         #
@@ -422,13 +423,61 @@ class LP_DDM(nn.Module):
         # 
         self.model_sam = []
         self.log_file = None
+    
     def load_ddm_ckpt(self, load_path, ema=False):
         checkpoint = torch.load(load_path, map_location=None)
         self.model.load_state_dict(checkpoint['state_dict'], strict=True)
-        self.ema_helper.load_state_dict(checkpoint['ema_helper'])
-        if ema:
+        if "ema_helper" in checkpoint:
+            self.ema_helper.load_state_dict(checkpoint['ema_helper'])
             self.ema_helper.ema(self.model)
-        print("=> loaded checkpoint {} step {}".format(load_path, self.step))
+        print("=> loaded checkpoint {}".format(load_path))
+
+    def restor(self, val_loader, device, resume=None):
+        if resume is not None:
+            self.load_ddm_ckpt(resume, ema=True)
+        self.model.to(device)
+        test_results = {}
+        test_results['psnr_l'] = []
+        test_results['ssim_l'] = []
+        for data_dict in tqdm(val_loader, desc="Sampling validation patches", total=len(val_loader)):
+
+            input0, img_h, img_w = check_size(data_dict[0][:, :3, :, :])
+            label, _, _ = check_size(data_dict[0][:, 3:, :, :])
+            
+            x0 = input0.to(device)
+            y = label.to(device)
+            if len(x0.shape) == 3:
+                x0 = x0.unsqueeze(0)
+                y = y.unsqueeze(0)
+                            
+            with torch.no_grad():
+                out = self.model(x0, y)
+
+            pred_x_tensor = torch.clamp(out["pred_x"], min=0, max=1)
+            # 1 3 1000 1500
+            pred_x_tensor = pred_x_tensor[:, :, :img_h, :img_w]
+
+            # 指标计算（逐样本计算）
+            pred_imgs = out["pred_x"].detach().cpu().numpy().astype(np.float32)  # [B, C, H, W]
+            labels = y.detach().cpu().numpy().astype(np.float32)  # [B, C, H, W]
+            
+            for b in range(pred_imgs.shape[0]):
+                pred_img = pred_imgs[b]  # [C, H, W]
+                label = labels[b]  # [C, H, W]
+                # PSNR计算
+                scene_psnr_l = calculate_psnr(label, pred_img, data_range=1.0)
+                # SSIM计算
+                pred_img_255 = np.clip(pred_img * 255.0, 0., 255.).transpose(1, 2, 0)
+                label_255 = np.clip(label * 255.0, 0., 255.).transpose(1, 2, 0)
+                scene_ssim_l = calculate_ssim(pred_img_255, label_255, data_range=255.0)
+                
+                test_results['psnr_l'].append(scene_psnr_l)
+                test_results['ssim_l'].append(scene_ssim_l)
+        
+        print(f"Val, Datasets len{len(val_loader)}", \
+            f"psnr-l: {np.mean(test_results['psnr_l']):.4f}", \
+            f"ssim-l: {np.mean(test_results['ssim_l']):.4f}")
+
 
     def train(self, train_loader, val_loader, train_sampler, dict_configs):
         

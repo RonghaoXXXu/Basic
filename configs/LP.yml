@@ -11,13 +11,13 @@ data:
     channels: 3
     num_workers: 2
 
-    name: GoPro_crop256
+    name: GoPro
     train:
         dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop128/input
         dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop128/target
     val:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test_crop128/input
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test_crop128/target
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test_crop256/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test_crop256/target
 
     # LLdataset
     # data_dir: /datasata/lxn/LowLight/LOL/LOLdataset/our485 # "our485"

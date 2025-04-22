@@ -133,7 +133,7 @@ def main_DDP():
     train_loader, val_loader, train_sampler = DATASET.get_loaders_ddp()
     
     # Model
-    model = models.__dict__[configs.model_name](configs=configs, args=args)
+    model = models.__dict__[configs.model_name](configs=configs, args=args, ddp=True)
     model.train(train_loader, val_loader, train_sampler, dict_configs)
 
 if __name__ == "__main__":
