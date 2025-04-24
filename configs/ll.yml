@@ -11,17 +11,17 @@ data:
     channels: 3
     num_workers: 2
 
-    name: GoPro_crop256
+    name: GoPro_crop
     train:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop256/input
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop256/target
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop_256/input_crops
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop_256/target_crops
     val:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/input
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/target
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test_crop_256/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test_crop_256/target
 
     # LLdataset
     # data_dir: /datasata/lxn/LowLight/LOL/LOLdataset/our485 # "our485"
-    ckpt_dir: /datadisk2/xuronghao/Projects/Diffusion-Low-Light-main/llckpt
+    ckpt_dir: /datadisk2/xuronghao/Projects/Basic/ckpt
     conditional: True
 
 LP:
@@ -50,7 +50,7 @@ training:
     batch_size: 4 # 4-512-OOM
     val_batch_size: 2
     n_epochs: 500
-    log_freq: 100
+    log_freq: 50
     validation_freq: 1000
 
 optim:
@@ -61,6 +61,11 @@ optim:
     eps: 0.00000001
     step_size: 50
     gamma: 0.8
+
+loss:
+    photo_loss_w: 0
+    noise_loss_w: 1
+    frequency_loss_w: 1
 
 
 DEBUG: False #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件
