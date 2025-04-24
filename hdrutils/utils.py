@@ -3,8 +3,9 @@ import numpy as np
 import os, glob
 import cv2
 import math
-import imageio
+# import imageio
 from math import log10
+from PIL import Image
 import random
 import torch
 import torch.nn as nn
@@ -12,10 +13,11 @@ import torch.nn.init as init
 # from skimage.measure. import compare_psnr
 # from skimage.measure import 
 # from skimage.metrics import peak_signal_noise_ratio as compare_psnr
-imageio.plugins.freeimage.download()
+# imageio.plugins.freeimage.download()
 
 
 def calculate_psnr(label, pred_img, data_range=1.0):
+
     """
     手动计算 PSNR。
     
@@ -101,8 +103,8 @@ def read_images(file_names):
     return np.array(imgs)
 
 def read_label(file_path, file_name):
-    label = imageio.imread(os.path.join(file_path, file_name), 'hdr')
-    label = label[:, :, [2, 1, 0]]  ##cv2
+    label = cv2.imread(os.path.join(file_path, file_name), -1)
+    # label = label[:, :, [2, 1, 0]]  ##cv2
     return label
 
 def ldr_to_hdr(imgs, expo, gamma):

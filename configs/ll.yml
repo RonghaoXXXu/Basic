@@ -63,9 +63,9 @@ optim:
     gamma: 0.8
 
 loss:
-    photo_loss_w: 0
-    noise_loss_w: 1
-    frequency_loss_w: 1
+    photo_loss_w: 0.0
+    noise_loss_w: 1.0
+    frequency_loss_w: 1.0
 
 
 DEBUG: False #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件

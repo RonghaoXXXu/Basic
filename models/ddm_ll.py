@@ -222,7 +222,7 @@ class Lap_Pyramid_Conv(nn.Module):
             # high-freq
             pyr.append((diff, current))
             current = down
-        # pyr.append(current)
+        pyr.append(current)
         return pyr
 
     def pyramid_recons(self, pyr):
@@ -261,21 +261,21 @@ class Net(nn.Module):
         self.config = config
 
         self.lp = Lap_Pyramid_Conv(num_high=config.LP.num_high, in_chans=config.LP.in_chans)
-        self.conv_LL_LL = nn.Sequential(
-            nn.Conv2d(6, 6, 3, 1, 1),
-            nn.LeakyReLU(),
-            nn.Conv2d(6, 6, 3, 1, 1),
-            nn.LeakyReLU(),
-            nn.Conv2d(6, 3, 3, 1, 1)
-        )
-        self.conv_LL = nn.Sequential(
-            nn.Conv2d(6, 6, 3, 1, 1),
-            nn.LeakyReLU(),
-            nn.Conv2d(6, 6, 3, 1, 1),
-            nn.LeakyReLU(),
-            nn.Conv2d(6, 3, 3, 1, 1)
-        )
-        self.final_conv = nn.Conv2d(3, 3, 3, 1, 1)
+        # self.conv_LL_LL = nn.Sequential(
+        #     nn.Conv2d(6, 6, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(6, 6, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(6, 3, 3, 1, 1)
+        # )
+        # self.conv_LL = nn.Sequential(
+        #     nn.Conv2d(6, 6, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(6, 6, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(6, 3, 3, 1, 1)
+        # )
+        # self.final_conv = nn.Conv2d(3, 3, 3, 1, 1)
 
         # num_in_ch = config.hdrvit.in_chans
         # num_out_ch = config.hdrvit.out_chans
@@ -345,18 +345,22 @@ class Net(nn.Module):
         # conv3
         
         input_high0, input_LL = input_lp[0]
-        input_high1, input_LL_LL = input_lp[1] 
-        input_denoise_LL_LL = torch.cat([input_LL_LL, denoise_high], dim=1)
-        pred_LL = self.conv_LL_LL(input_denoise_LL_LL)
+        input_high1, input_LL_LL = input_lp[1]
+        input_down =  input_lp[-1]
+        # input_denoise_LL_LL = torch.cat([input_LL_LL, denoise_high], dim=1)
+        # pred_LL = input_LL_LL + denoise_high
         # pred_LL += input_LL_LL
 
-        pred_LL = F.interpolate(pred_LL, scale_factor=2, mode='bicubic', align_corners=False)
+        # pred_LL = F.interpolate(pred_LL, scale_factor=2, mode='bicubic', align_corners=False)
         
-        pred_x = torch.cat([input_high0, pred_LL], dim=1)
-        pred_x = self.conv_LL(pred_x)
-        pred_x += self.final_conv(x)
+        # pred_x = torch.cat([input_high0, pred_LL], dim=1)
 
-        return pred_x, pred_LL
+        pred_x = self.lp.pyramid_recons([input_high0, denoise_high, input_down])
+
+        # pred_x = self.conv_LL(pred_x)
+        # pred_x += self.final_conv(x)
+
+        return pred_x, None
 
     def forward(self, x, label):
         data_dict = {}
@@ -442,6 +446,7 @@ class LL_DDM(nn.Module):
             self.ema_helper.ema(self.model)
         print("=> loaded checkpoint {}".format(load_path))
     
+    @torch.no_grad()
     def restor(self, val_loader, device, resume=None):
         if resume is not None:
             self.load_ddm_ckpt(resume, ema=True)
@@ -665,13 +670,13 @@ class LL_DDM(nn.Module):
         _, gt_LL = gt_lp[0]
         gt_high1, _ = gt_lp[1]
         
-        pred_LL = output["pred_LL"]
+        # pred_LL = output["pred_LL"]
         # self.l2_loss(pred_LL, gt_LL)) 
         frequency_loss = 0.1 * (#self.l2_loss(input_high0, gt_high0) +
                                 self.l2_loss(pred_high1, gt_high1)) +\
                          0.01 * (self.TV_loss(input_high0) +
                                  self.TV_loss(input_high1) +
-                                 self.TV_loss(pred_LL))
+                                 self.TV_loss(pred_high1))
 
         # =============photo loss==================
         content_loss = self.l1_loss(pred_x, gt_img)
@@ -679,7 +684,9 @@ class LL_DDM(nn.Module):
 
         photo_loss = content_loss + ssim_loss
 
-        return noise_loss, photo_loss, frequency_loss
+        return self.configs.loss.noise_loss_w * noise_loss, \
+            self.configs.loss.photo_loss_w * photo_loss, \
+            self.configs.loss.frequency_loss_w * frequency_loss
     
     def sample_validation_patches(self, val_loader, step, date_dir):
         if not self.configs.DEBUG:

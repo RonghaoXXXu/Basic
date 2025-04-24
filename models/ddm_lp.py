@@ -345,7 +345,7 @@ class Net(nn.Module):
         # conv3
         
         input_high0, input_LL = input_lp[0]
-        pred_x = denoise_high + input_LL
+        pred_x = denoise_high + self.final_conv(input_LL)
         # pred_x += self.final_conv(x)
 
         return pred_x, None
@@ -369,16 +369,16 @@ class Net(nn.Module):
             gt_lp= self.lp.pyramid_decom(label)
             gt_high0, gt_LL = gt_lp[0]  
 
-            xet = gt_high0 * a.sqrt() + e * (1.0 - a).sqrt()
-            noise_output = self.Unet(torch.cat([input_high0, xet], dim=1), t.float())
-            denoise_high0 = self.sample_training(input_high0, b)
+            xet = data_transform(gt_high0) * a.sqrt() + e * (1.0 - a).sqrt()
+            noise_output = self.Unet(torch.cat([data_transform(input_high0), xet], dim=1), t.float())
+            denoise_high0 = self.sample_training(data_transform(input_high0), b)
 
             # cat(input_LL_LL, denoise_high1)
             # up -> LL
             # cat(input_high0, LL)
             # conv3
             #
-            # denoise_high1 = inverse_data_transform(denoise_high1)
+            denoise_high0 = inverse_data_transform(denoise_high0)
             pred_x, pred_LL = self.recon(input_lp, denoise_high0, x)
             # cl_pred_x = torch.clamp(pred_x, min=0, max=1)
 
@@ -394,8 +394,9 @@ class Net(nn.Module):
 
         else:
             # label 随意填充为 zeros_like(input_img) 
-            denoise_high1 = self.sample_training(input_high0, b)
-            pred_x, _ = self.recon(input_lp, denoise_high1, x)
+            denoise_high0 = self.sample_training(data_transform(input_high0), b)
+            denoise_high0 = inverse_data_transform(denoise_high0)
+            pred_x, _ = self.recon(input_lp, denoise_high0, x)
             # cl_pred_x = torch.clamp(pred_x, min=0, max=1)
             data_dict["pred_x"] = pred_x
 
@@ -432,6 +433,7 @@ class LP_DDM(nn.Module):
             self.ema_helper.ema(self.model)
         print("=> loaded checkpoint {}".format(load_path))
 
+    @torch.no_grad()
     def restor(self, val_loader, device, resume=None):
         if resume is not None:
             self.load_ddm_ckpt(resume, ema=True)

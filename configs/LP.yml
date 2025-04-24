@@ -16,8 +16,8 @@ data:
         dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop128/input
         dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop128/target
     val:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test_crop256/input
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test_crop256/target
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test_crop_256/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test_crop_256/target
 
     # LLdataset
     # data_dir: /datasata/lxn/LowLight/LOL/LOLdataset/our485 # "our485"
