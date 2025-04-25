@@ -731,9 +731,29 @@ class LL_DDM(nn.Module):
                 # if not self.configs.DEBUG and i % 20 == 0:
                 #     cv2.imwrite(os.path.join(image_folder, f"{step}_{i}_{b}.png"), save_pred_img)
                 
+                _y = torch.squeeze(y[b].detach().cpu()).numpy().astype(np.float32)
+                save_pred_gt = (_y * 255).astype(np.uint8)
+                save_pred_gt = cv2.cvtColor(save_pred_gt.transpose(1, 2, 0), cv2.COLOR_BGR2RGB)
+                
+                # if self.configs.wandb.is_use_wandb and i % 20 == 0:
+                #     wandb.log({
+                #         f"HDR_MU_IMG_{i}_{b}": wandb.Image(save_pred_img, caption=f"val_{step}_{i}_{b}")
+                #     })
+                    # 如果需要标注，可以在图像上添加文字说明
+                combined_image = cv2.hconcat([save_pred_img, save_pred_gt])
+                combined_image = cv2.putText(
+                    combined_image,
+                    "Pred", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+                )
+                combined_image = cv2.putText(
+                    combined_image,
+                    "GT", (save_pred_img.shape[1] + 10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+                )
+
+                # 使用 wandb 记录合并后的图像
                 if self.configs.wandb.is_use_wandb and i % 20 == 0:
                     wandb.log({
-                        f"HDR_MU_IMG_{i}_{b}": wandb.Image(save_pred_img, caption=f"val_{step}_{i}_{b}")
+                        f"HDR_MU_IMG_GT_{i}_{b}": wandb.Image(combined_image, caption=f"val_{step}_{i}_{b}")
                     })
     
             # 指标计算（逐样本计算）
@@ -755,45 +775,6 @@ class LL_DDM(nn.Module):
                 test_results['psnr_l'].append(scene_psnr_l)
                 test_results['ssim_l'].append(scene_ssim_l)
 
-            # pred_x = torch.squeeze(pred_x_tensor.detach().cpu()).numpy().astype(np.float32)
-            # save_pred_img = (pred_x * 255).astype(np.uint8)
-            # save_pred_img = cv2.cvtColor(save_pred_img.transpose(1, 2, 0), cv2.COLOR_BGR2RGB)
-
-            # if not self.configs.DEBUG and i % 20 == 0:
-            #     cv2.imwrite(os.path.join(image_folder, f"{step}_{i}.png"), save_pred_img)
-            # # 上传预测图像到 wandb
-            # if self.configs.wandb.is_use_wandb and i % 20 == 0:
-            #     wandb.log({
-            #         f"HDR_MU_IMG_{i}": wandb.Image(save_pred_img, caption=f"val_{step}")
-            #     })
-                
-            # # save_hdr = pred_x.copy().transpose(1, 2, 0)[..., ::-1]
-            # # if not self.configs.DEBUG:
-            # #     radiance_writer(os.path.join(image_folder, f"{step}_{i}.hdr"), save_hdr)
-            
-            # ## psnr
-            # pred_img = torch.squeeze(out["pred_x"].detach().cpu()).numpy().astype(np.float32)
-
-            # label = torch.squeeze(y.detach().cpu()).numpy().astype(np.float32)
-            # scene_psnr_l = calculate_psnr(label, pred_img, data_range=1.0)
-            # label_mu = range_compressor(label)
-            # # pred_img_mu = range_compressor(pred_img) # the estimated tonemapped HDR image
-            # # scene_psnr_mu = calculate_psnr(label_mu, pred_img_mu, data_range=1.0)
-            
-            # # ssim-l
-            # pred_img = np.clip(pred_img * 255.0, 0., 255.).transpose(1, 2, 0)
-            # label = np.clip(label * 255.0, 0., 255.).transpose(1, 2, 0)
-            # scene_ssim_l = calculate_ssim(pred_img, label, data_range=255.0)
-            
-            # # ssim-\mu
-            # # pred_img_mu = np.clip(pred_img_mu * 255.0, 0., 255.).transpose(1, 2, 0)
-            # # label_mu = np.clip(label_mu * 255.0, 0., 255.).transpose(1, 2, 0)
-            # # scene_ssim_mu = calculate_ssim(pred_img_mu, label_mu, data_range=255.0)
-        
-            # test_results['psnr_l'].append(scene_psnr_l)
-            # test_results['ssim_l'].append(scene_ssim_l)
-            # # test_results['psnr_mu'].append(scene_psnr_mu)
-            # # test_results['ssim_mu'].append(scene_ssim_mu)
         
         psnr_l = np.mean(test_results['psnr_l'])
         ssim_l = np.mean(test_results['ssim_l'])
