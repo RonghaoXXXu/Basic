@@ -371,7 +371,7 @@ class Net(nn.Module):
 
         self.args = args
         self.config = config
-
+        self.vae = Lap_Pyramid_Conv(LP_config=self.config.VAE.LP)
         self.Unet = DiT(config)
 
         betas = get_beta_schedule(
@@ -419,10 +419,12 @@ class Net(nn.Module):
     
     # 隐空间扩散
     def forward(self, x, gt):
+        x_lp = self.vae.pyramid_decom(x)
+
         data_dict = {}
         ########################
         # input_lp = self.lp.pyramid_decom(x)
-        input_high = x
+        input_high = x_lp[-2]
         ########################
         b = self.betas.to(input_high.device)
 
@@ -436,7 +438,8 @@ class Net(nn.Module):
         if self.training:
             # gt_lp= self.lp.pyramid_decom(label)
             # gt_high0, gt_LL = gt_lp[0]
-            gt_high = gt
+            gt_lp = self.vae.pyramid_decom(gt)
+            gt_high = gt_lp[-2]
 
             xet = gt_high * a.sqrt() + e * (1.0 - a).sqrt()
             noise_output = self.Unet(torch.cat([input_high, xet], dim=1), t.float())
@@ -453,20 +456,28 @@ class Net(nn.Module):
 
             # data_dict["input_lp"] = input_lp               
             # data_dict["gt_lp"] = gt_lp
+
+            x_cond_pred_list = x_lp[:-2] + [denoise_high, x_lp[-1]]
+            pred_x = self.vae(x_cond_pred_list, x)
+            data_dict["pred_x"] = pred_x
             data_dict["pred"] = denoise_high
             data_dict["noise_output"] = noise_output
             data_dict["e"] = e
+            data_dict["gt"] = gt_high
 
         else:
             # label 随意填充为 zeros_like(input_img) 
             denoise_high = self.sample_training(input_high, b)
+            x_cond_pred_list = x_lp[:-2] + [denoise_high, x_lp[-1]]
+            pred_x = self.vae(x_cond_pred_list, x)
             # pred_x, _ = self.recon(input_lp, denoise_high1)
             # cl_pred_x = torch.clamp(pred_x, min=0, max=1)
             data_dict["pred"] = denoise_high
+            data_dict["pred_x"] = pred_x
 
         return data_dict
     
-class LL_DDM(nn.Module):
+class DDM(nn.Module):
     def __init__(self, configs, args, use_ddp=True, use_accelerate=True):
         super().__init__()
         self.configs = configs
@@ -483,14 +494,14 @@ class LL_DDM(nn.Module):
                 log_with="wandb" if self.configs.wandb.is_use_wandb else None,
                 kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]
             )
-            self.vae = Lap_Pyramid_Conv(LP_config=self.configs.VAE.LP)
+            # self.vae = Lap_Pyramid_Conv(LP_config=self.configs.VAE.LP)
             self.args.gpu = self.accelerator.device
             if self.accelerator.use_distributed:
                 self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-                self.vae = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.vae)
-            self.optimizer_vae, self.scheduler_vae = get_optimizer(self.configs, self.vae.parameters())
-            self.ema_helper_vae = EMAHelper()
-            self.ema_helper_vae.register(self.vae) 
+                # self.vae = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.vae)
+            # self.optimizer_vae, self.scheduler_vae = get_optimizer(self.configs, self.vae.parameters())
+            # self.ema_helper_vae = EMAHelper()
+            # self.ema_helper_vae.register(self.vae) 
 
         self.ema_helper = EMAHelper()
         self.ema_helper.register(self.model)
@@ -730,8 +741,10 @@ class LL_DDM(nn.Module):
                 """
             )
         
-        self.model, self.vae, self.optimize, self.scheduler, self.optimizer_vae, self.scheduler_vae, train_loader, val_loader = \
-            self.accelerator.prepare(self.model, self.vae, self.optimizer, self.scheduler, self.optimizer_vae, self.scheduler_vae, train_loader, val_loader) 
+        # self.model, self.vae, self.optimize, self.scheduler, self.optimizer_vae, self.scheduler_vae, train_loader, val_loader = \
+        #     self.accelerator.prepare(self.model, self.vae, self.optimizer, self.scheduler, self.optimizer_vae, self.scheduler_vae, train_loader, val_loader)
+        self.model, self.optimize, self.scheduler, train_loader, val_loader = \
+            self.accelerator.prepare(self.model, self.optimizer, self.scheduler, train_loader, val_loader)
 
         for epoch in range(self.configs.training.n_epochs):
             self.model.train()
@@ -747,45 +760,28 @@ class LL_DDM(nn.Module):
 
                 self.step += 1
                 # 隐空间压缩
-                with self.accelerator.accumulate([self.model, self.vae]), self.accelerator.autocast():
-                    un_warp_vae = self.accelerator.unwrap_model(self.vae)
-                    x_cond_lp = un_warp_vae.pyramid_decom(x_cond)
-                    y_lp = un_warp_vae.pyramid_decom(y)
+                with self.accelerator.accumulate(self.model), self.accelerator.autocast():
+                    # un_warp_vae = self.accelerator.unwrap_model(self.vae)
+                    # x_cond_lp = un_warp_vae.pyramid_decom(x_cond)
+                    # y_lp = un_warp_vae.pyramid_decom(y)
 
-                    input_high, gt_high = x_cond_lp[-2].detach(), y_lp[-2].detach()
-                    output = self.model(input_high, gt_high)
+                    # input_high, gt_high = x_cond_lp[-2].detach(), y_lp[-2].detach()
+                    output = self.model(x_cond, y)
                     noise_loss, pred_loss = self.l2_loss(output["noise_output"], output["e"]), \
-                                            self.l1_loss(output["pred"], y_lp[-2])
+                                            self.l1_loss(output["pred"], output["gt"])
                     loss_df = self.configs.loss.noise_loss_w * noise_loss + \
                                 self.configs.loss.pred_loss_w * pred_loss
                                         
-                    self.accelerator.backward(loss_df)
-                    self.optimize.step()
-                    self.optimize.zero_grad(set_to_none=True)
-
-                    requires_grad(self.model, False)
-                    self.model.eval()
-                    with torch.no_grad():
-                        output_ = self.model(x_cond_lp[-2], y_lp[-2])
-
-                    x_cond_pred_list = x_cond_lp[:-2] + [output_["pred"].detach(), x_cond_lp[-1]]
-                    pred_x = self.vae(x_cond_pred_list, x_cond)
-                    pred_x = pred_x[:, :, :imgh, :imgw]
+                    pred_x = output["pred_x"][:, :, :imgh, :imgw]
                     y = y[:, :, :imgh, :imgw]
 
                     photo_loss, ssim_loss = self.l1_loss(pred_x, y), (1 - ssim(pred_x, y, data_range=1.0))
                     loss_vae = self.configs.loss.photo_loss_w * photo_loss + \
                                 self.configs.loss.ssim_loss_w * ssim_loss
                     
-                    self.accelerator.backward(loss_vae)
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.vae.parameters(), 1.0)
-                    # 同时更新 model 和 vae
-                    self.optimizer_vae.step()
-                    self.optimizer_vae.zero_grad(set_to_none=True)
-                    
-                    requires_grad(self.model, True)
-                    self.model.train()
+                    self.accelerator.backward(loss_df + loss_vae)
+                    self.optimize.step()
+                    self.optimize.zero_grad()
 
                     if self.step % self.configs.training.log_freq == 0 and self.accelerator.is_main_process and self.step!= 0:
                         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -812,12 +808,12 @@ class LL_DDM(nn.Module):
                         }, step=self.step)
                         
                         self.ema_helper.update(self.accelerator.unwrap_model(self.model))
-                        self.ema_helper_vae.update(self.accelerator.unwrap_model(self.vae))
+                        # self.ema_helper_vae.update(self.accelerator.unwrap_model(self.vae))
 
                     if self.step % self.configs.training.validation_freq == 0 and self.step!= 0:
                         # 切换到评估模式
                         self.model.eval()
-                        self.vae.eval()
+                        # self.vae.eval()
                         # 验证集采样（仅主进程）
                         if self.accelerator.is_main_process:
                             ssims, psnrs = [], []
@@ -829,15 +825,13 @@ class LL_DDM(nn.Module):
                                 with torch.no_grad():
                                     val_x_cond = x[:, :3, :, :]
                                     val_y = x[:, 3:, :, :]
-                                    un_warp_vae = self.accelerator.unwrap_model(self.vae)
-                                    val_x_cond_lp = un_warp_vae.pyramid_decom(val_x_cond)
 
-                                    val_input_high = val_x_cond_lp[-2][0]
-                                    val_output = self.model(val_input_high, None)
+                                    val_x_cond, imgh, imgw = check_size(val_x_cond)
+                                    val_y, _, _ = check_size(val_y)
 
+                                    val_output = self.model(val_x_cond, None)
                                     val_pred_z = val_output["pred"]
-                                    val_x_cond_pred_list = [it[0] for it in val_x_cond_lp[:-2]] + [val_output["pred"], val_x_cond_lp[-1]]
-                                    val_pred_x = self.vae(val_x_cond_pred_list)
+                                    val_pred_x = val_output["pred_x"][:, :, :imgh, :imgw]
                                     val_pred_x = torch.clamp(val_pred_x, min=0, max=1)
                                     
                                     # RGB
@@ -878,13 +872,11 @@ class LL_DDM(nn.Module):
 
                         # 切换回训练模式
                         self.model.train()
-                        self.vae.train()
+                        # self.vae.train()
 
 
             self.scheduler.step()
-            self.scheduler_vae.step()     
-                    
-
+            # self.scheduler_vae.step()     
     
     def estimation_loss(self, x, output):
 

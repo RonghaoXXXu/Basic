@@ -1,5 +1,5 @@
 work_name: Diffusion_LP_Deblur
-model_name: LL_DDM
+model_name: DDM
 
 data:
     type: IRdataset
@@ -82,8 +82,8 @@ accelerator:
     gradient_accumulation_steps: 2 # 表示每 4 个 batch 才更新一次。
 
 loss:
-    photo_loss_w: 1.0 # gt_img vs pred_img
-    ssim_loss_w: 1.0
+    photo_loss_w: 0 # gt_img vs pred_img
+    ssim_loss_w: 0
     noise_loss_w: 1.0 # diffsuion
     pred_loss_w: 1.0 # 隐空间
 
@@ -92,7 +92,7 @@ loss:
 DEBUG: True #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件
 
 wandb:
-    is_use_wandb: False
+    is_use_wandb: True
     APIkeys: a887abe896653dfe4d9247ad2a5f5717734c0e11
     # team
     entity: DiffLLIR
