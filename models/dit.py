@@ -141,6 +141,8 @@ class DiT(nn.Module):
         self.final_layer = FinalLayer(self.hidden_size, self.patch_size * self.patch_size * config.DiT.in_chans)
 
     def forward(self, x, t):
+        
+        
         # Timestep embedding
         temb = get_timestep_embedding(t, self.config.DiT.t_ch)
         temb = self.temb(temb)

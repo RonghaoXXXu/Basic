@@ -6,22 +6,23 @@ import time, os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.init as init
 import cv2
 import torch.nn.functional as F
 from models.unet import DiffusionUNet
 from models.dit import DiT
-from models.wavelet import DWT, IWT
 from pytorch_msssim import ssim
-from models.mods import HFRM
 from hdrutils.utils import radiance_writer, range_compressor, calculate_psnr, calculate_ssim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from utils.optimize import get_optimizer
 import wandb
+from omegaconf import OmegaConf
+import torchvision.transforms as transforms
 from tqdm import tqdm
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from skimage.metrics import peak_signal_noise_ratio as compare_psnr
 from skimage.metrics import structural_similarity as compare_ssim
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from models.lp_utils import Upsample, RCAB, ReduceChannel, SpatialTemporalTransformerBlock, bchw_to_blc, blc_to_bchw
 
 def check_size(x):
     _, _, img_h, img_w = x.shape
@@ -177,44 +178,43 @@ class Lap_Pyramid_Conv(nn.Module):
     Args:
         num_high (int): Number of high-frequency components
     """
-    def __init__(self, num_high=3, in_chans=24):
+    def __init__(self, LP_config):
         super(Lap_Pyramid_Conv, self).__init__()
 
-        self.num_high = num_high
-        self.channels = in_chans
-        self.kernel = nn.Parameter(self.gauss_kernel(channels=self.channels), requires_grad=False)
-        # self.conv_LL_LL = nn.Sequential(
-        #     nn.Conv2d(3, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 3, 3, 1, 1)
-        # )
-        # self.conv_LL = nn.Sequential(
-        #     nn.Conv2d(3, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 16, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(16, 3, 3, 1, 1)
-        # )
+        self.num_high = LP_config.num_high
+        self.channels = LP_config.in_chans
+        self.embed_dim = LP_config.embed_dim
+        self.kernel = nn.Parameter(self.gauss_kernel(channels=self.embed_dim), requires_grad=False)
+        self.pos_drop = nn.Dropout(p=LP_config.drop_rate)
+        
+        # 3 -> 16
+        self.conv_x = nn.Conv2d(self.channels, self.embed_dim, 3, 1, 1)
+        self.conv_f = nn.Conv2d(self.embed_dim, self.channels, 3, 1, 1)
 
-        # self.init_weights(self.conv_LL_LL)
-        # self.init_weights(self.conv_LL)
+        self.channel_attention = nn.ModuleList(
+            [RCAB(n_feat=2*self.embed_dim if i <self.num_high else self.embed_dim, reduction=2)
+                 for i in range(self.num_high + 1)]
+        )
+        self.up_sample = nn.ModuleList(
+            [Upsample(2*self.embed_dim) for _ in range(self.num_high-1)]
+        )
+        self.reduce_channel = nn.ModuleList(
+            [ReduceChannel(2*self.embed_dim) for _ in range(self.num_high)]
+        )
+        self.apply(self._init_weights)
 
-    def init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            # 使用 Kaiming 初始化，适用于 LeakyReLU(negative_slope=0.2)
-            init.kaiming_normal_(m.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            m.weight.data.normal_(0.0, 0.02)
             if m.bias is not None:
-                init.constant_(m.bias, 0)
+                m.bias.data.normal_(0.0, 0.02)
 
     def gauss_kernel(self, channels=3):
         kernel = torch.tensor([[1., 4., 6., 4., 1],
@@ -272,7 +272,7 @@ class Lap_Pyramid_Conv(nn.Module):
         """
         High Low
         """
-        current = img
+        current = self.conv_x(img)
         pyr = []
         for _ in range(self.num_high):
             filtered = self.conv_gauss(current, self.kernel) # Blurs an image with a gaussian kernel
@@ -288,12 +288,13 @@ class Lap_Pyramid_Conv(nn.Module):
                 up = F.interpolate(up, size=(current.shape[2], current.shape[3]))
             diff = current - up # Laplacial Pyramid
             # high-freq
-            pyr.append((diff, current))
+            # pyr.append((diff, current))
+            pyr.append(diff)
             current = down
         pyr.append(current)
         return pyr
     # pyramid_recons
-    def forward(self, pyr):
+    def pyramid_recons(self, pyr):
         image = pyr[-1] # pyr=[h_0^hat, h_1^hat, h_2^hat, I_3^hat]
         # print("***********************")
         # print(image.size())
@@ -312,6 +313,44 @@ class Lap_Pyramid_Conv(nn.Module):
             # else:
             image = up + level
         return image
+    def forward(self, pyr, x):
+        # B 3 H W
+        # pyr = self.pyramid_decom(x_list)
+        pyr_low = pyr[-1]
+        ############
+        pyr_low_up = F.interpolate(pyr_low, scale_factor=2, mode='nearest')
+        pyr_result = []
+        for i in range(self.num_high):
+            pyr_high = pyr[self.num_high-(i+1)]
+            assert pyr_high.shape == pyr_low_up.shape, print(pyr_high.shape, pyr_low_up.shape)
+            # 2 * embed_dim
+            pyr_high_with_low = torch.cat([pyr_high, pyr_low_up], dim=1)
+            pyr_high_with_low_size = (pyr_high_with_low.shape[2:])
+            # 2 * embed_dim
+            pyr_high_with_low = torch.cat([pyr_high, pyr_low_up], dim=1)
+            pyr_high_with_low_size = (pyr_high_with_low.shape[2:])
+            pyr_high_with_low = bchw_to_blc(self.channel_attention[i](pyr_high_with_low))
+            pyr_high_with_low = self.pos_drop(pyr_high_with_low)
+            # layers
+            result_highfreq = blc_to_bchw(pyr_high_with_low, pyr_high_with_low_size)
+            # 
+            if i < self.num_high-1:
+                # pyr_low_up = F.interpolate(result_highfreq, size=pyr[self.num_high-(i+2)].shape[2:])
+                # pyr_low_up = F.interpolate(result_highfreq, scale_factor=2, mode='nearest')
+                pyr_low_up = self.up_sample[i](result_highfreq)
+            # pre_high, pyr_low_up = self.up_sample[i](pyr_high_with_low)
+            # pyr_result.append(pre_high)
+            result_highfreq = self.reduce_channel[i](result_highfreq)
+            setattr(self, f'result_highfreq_{str(i)}', result_highfreq)
+        
+        for i in reversed(range(self.num_high)):
+            result_highfreq = getattr(self, f'result_highfreq_{str(i)}')
+            pyr_result.append(result_highfreq)
+
+        pyr_result.append(pyr_low)
+        # self.pyramid_recons(pyr_result)
+        r = self.pyramid_recons(pyr_result)
+        return x + self.conv_f(r)
 
 
 class SpatialAttentionModule(nn.Module):
@@ -441,10 +480,10 @@ class LL_DDM(nn.Module):
             self.accelerator = Accelerator(
                 mixed_precision=self.configs.accelerator.mixed_precision,
                 gradient_accumulation_steps=self.configs.accelerator.gradient_accumulation_steps,
-                log_with="wandb" if self.configs.wandb.is_use_wandb else None
+                log_with="wandb" if self.configs.wandb.is_use_wandb else None,
+                kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]
             )
-            self.vae = Lap_Pyramid_Conv(num_high=configs.VAE.LP.num_high, \
-                in_chans=configs.VAE.LP.in_chans)
+            self.vae = Lap_Pyramid_Conv(LP_config=self.configs.VAE.LP)
             self.args.gpu = self.accelerator.device
             if self.accelerator.use_distributed:
                 self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
@@ -703,8 +742,8 @@ class LL_DDM(nn.Module):
                 x_cond = x[:, :3, :, :]
                 y = x[:, 3:, :, :]
 
-                # x_cond, imgh, imgw = check_size(x_cond)
-                # y, _, _ = check_size(y)
+                x_cond, imgh, imgw = check_size(x_cond)
+                y, _, _ = check_size(y)
 
                 self.step += 1
                 # 隐空间压缩
@@ -713,37 +752,40 @@ class LL_DDM(nn.Module):
                     x_cond_lp = un_warp_vae.pyramid_decom(x_cond)
                     y_lp = un_warp_vae.pyramid_decom(y)
 
-                    input_high, gt_high = x_cond_lp[-2][0], y_lp[-2][0]
+                    input_high, gt_high = x_cond_lp[-2].detach(), y_lp[-2].detach()
                     output = self.model(input_high, gt_high)
-                    noise_loss, pred_loss = self.l2_loss(output["noise_output"], output["e"]), self.l1_loss(output["pred"], y_lp[-2][0])
+                    noise_loss, pred_loss = self.l2_loss(output["noise_output"], output["e"]), \
+                                            self.l1_loss(output["pred"], y_lp[-2])
                     loss_df = self.configs.loss.noise_loss_w * noise_loss + \
                                 self.configs.loss.pred_loss_w * pred_loss
                                         
-                    # self.accelerator.backward(loss_df)
-                    # self.optimize.step()
-                    # self.optimize.zero_grad(set_to_none=True)
+                    self.accelerator.backward(loss_df)
+                    self.optimize.step()
+                    self.optimize.zero_grad(set_to_none=True)
 
-                    # requires_grad(self.model, False)
-                    # with torch.no_grad():
-                    #     output_ = self.model(x_cond_lp[-2][0], y_lp[-2][0])
+                    requires_grad(self.model, False)
+                    self.model.eval()
+                    with torch.no_grad():
+                        output_ = self.model(x_cond_lp[-2], y_lp[-2])
 
-                    x_cond_pred_list = [it[0] for it in x_cond_lp[:-2]] + [output["pred"], x_cond_lp[-1]]
+                    x_cond_pred_list = x_cond_lp[:-2] + [output_["pred"].detach(), x_cond_lp[-1]]
+                    pred_x = self.vae(x_cond_pred_list, x_cond)
+                    pred_x = pred_x[:, :, :imgh, :imgw]
+                    y = y[:, :, :imgh, :imgw]
 
-                    pred_x = self.vae(x_cond_pred_list)
                     photo_loss, ssim_loss = self.l1_loss(pred_x, y), (1 - ssim(pred_x, y, data_range=1.0))
                     loss_vae = self.configs.loss.photo_loss_w * photo_loss + \
                                 self.configs.loss.ssim_loss_w * ssim_loss
                     
-                    self.accelerator.backward(loss_df)
-                    # if self.accelerator.sync_gradients:
-                    #     self.accelerator.clip_grad_norm_(self.vae.parameters(), 1.0)
-                    self.optimize.step()
-                    self.optimize.zero_grad(set_to_none=True)
-                    # self.optimizer_vae.step()  
-                    # self.optimizer_vae.zero_grad(set_to_none=True)
+                    self.accelerator.backward(loss_vae)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.vae.parameters(), 1.0)
+                    # 同时更新 model 和 vae
+                    self.optimizer_vae.step()
+                    self.optimizer_vae.zero_grad(set_to_none=True)
                     
-                    # requires_grad(self.model, True)
-                    # self.model.train()
+                    requires_grad(self.model, True)
+                    self.model.train()
 
                     if self.step % self.configs.training.log_freq == 0 and self.accelerator.is_main_process and self.step!= 0:
                         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1098,56 +1140,71 @@ if __name__ == '__main__':
     ## 测试本文件，在models文件夹所在目录下运行，“python -m models.ddm_hdr”
     ## 避免在包内运行测试代码
     
-    device = torch.device("cpu")
+    # device = torch.device("cpu")
 
-    x0 = torch.randn(1, 3, 256, 256, device=device)
-    presl = torch.zeros_like(x0)
+    # x0 = torch.randn(1, 3, 256, 256, device=device)
+    # presl = torch.zeros_like(x0)
 
-    args = argparse.Namespace()
-    args.sampling_timesteps = 10
+    # args = argparse.Namespace()
+    # args.sampling_timesteps = 10
 
-    config_dict = {
-        "data": {
-            "conditional": True
-        },
-        "LP": {
-            "num_high": 2,
-            "in_chans": 3
-        },
-        "model": {
-            "in_channels": 3,
-            "out_ch": 3,
-            "ch": 64,
-            "ch_mult": [1, 2, 3, 4],
-            "num_res_blocks": 2,
-            "dropout": 0.0,
-            "ema_rate": 0.999,
-            "ema": True,
-            "resamp_with_conv": True
-        },
-        "diffusion": {
-            "beta_schedule": "linear",
-            "beta_start": 0.0001,
-            "beta_end": 0.02,
-            "num_diffusion_timesteps": 200
-        }
-    }
+    # config_dict = {
+    #     "data": {
+    #         "conditional": True
+    #     },
+    #     "LP": {
+    #         "num_high": 2,
+    #         "in_chans": 3
+    #     },
+    #     "model": {
+    #         "in_channels": 3,
+    #         "out_ch": 3,
+    #         "ch": 64,
+    #         "ch_mult": [1, 2, 3, 4],
+    #         "num_res_blocks": 2,
+    #         "dropout": 0.0,
+    #         "ema_rate": 0.999,
+    #         "ema": True,
+    #         "resamp_with_conv": True
+    #     },
+    #     "diffusion": {
+    #         "beta_schedule": "linear",
+    #         "beta_start": 0.0001,
+    #         "beta_end": 0.02,
+    #         "num_diffusion_timesteps": 200
+    #     }
+    # }
 
-    # 转换为 Namespace
-    configs = dict_to_namespace(config_dict)
+    # # 转换为 Namespace
+    # configs = dict_to_namespace(config_dict)
 
-    pmodel = Net(args, configs).to(device)
-    pmodel.eval()
+    # pmodel = Net(args, configs).to(device)
+    # pmodel.eval()
 
-    with torch.no_grad():
-        x0, imgh, imgw = check_size(x0)
-        presl, _, _ = check_size(presl)
+    # with torch.no_grad():
+    #     x0, imgh, imgw = check_size(x0)
+    #     presl, _, _ = check_size(presl)
         
-        pred = pmodel(x0, presl)
-        pred_x = pred['pred_x'][:, :, :imgh, :imgw]
+    #     pred = pmodel(x0, presl)
+    #     pred_x = pred['pred_x'][:, :, :imgh, :imgw]
         
-    print(pred['pred_x'].shape)
+    # print(pred['pred_x'].shape)
+
+    lp_config = OmegaConf.load("/datadisk2/xuronghao/Projects/Basic/configs/ll.yml")
+    LP = Lap_Pyramid_Conv(lp_config.VAE.LP)
+    inputp = "/datadisk2/xuronghao/Datasets/GoPro/train/input/GOPR0871_11_01-000249.png"
+    targetp = "/datadisk2/xuronghao/Datasets/GoPro/train/target/GOPR0871_11_01-000249.png"
+    TF = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor()
+    ])
+    input = TF(Image.open(inputp).convert("RGB")).unsqueeze(0)
+    target = TF(Image.open(targetp).convert("RGB")).unsqueeze(0)
+
     
-    
-    
+    in_lp = LP.pyramid_decom(input)
+    gt_lp = LP.pyramid_decom(target)
+
+    pred_x = LP(in_lp[:-2] + [gt_lp[-2], in_lp[-1]], input)
+    print(pred_x.shape)
     

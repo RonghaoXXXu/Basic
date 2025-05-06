@@ -23,13 +23,16 @@ data:
     # data_dir: /datasata/lxn/LowLight/LOL/LOLdataset/our485 # "our485"
     ckpt_dir: /datadisk2/xuronghao/Projects/Basic/ckpt
     conditional: True
+
 VAE:
     type: LP
     LP:
         num_high: 5 #/16
         # Low-light，hdr：6
         in_chans: 3
-
+        drop_rate: 0.0
+        embed_dim: 16
+# Unet
 model:
     in_channels: 3
     out_ch: 3
@@ -43,7 +46,7 @@ model:
 
 DiT:
     patch_size: 1
-    in_chans: 3
+    in_chans: 16 #16 OOM
     t_ch: 16
     hidden_size: 256
     depth: 6
@@ -89,7 +92,7 @@ loss:
 DEBUG: True #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件
 
 wandb:
-    is_use_wandb: True
+    is_use_wandb: False
     APIkeys: a887abe896653dfe4d9247ad2a5f5717734c0e11
     # team
     entity: DiffLLIR
