@@ -13,21 +13,22 @@ data:
 
     name: GoPro_crop
     train:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train_crop_256/input_crops
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train_crop_256/target_crops
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/train/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/train/target
     val:
-        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test_crop_256/input
-        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test_crop_256/target
+        dataroot_lq: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/input
+        dataroot_gt: /datadisk2/xuronghao/Datasets/GoPro/test/GoPro/target
 
     # LLdataset
     # data_dir: /datasata/lxn/LowLight/LOL/LOLdataset/our485 # "our485"
     ckpt_dir: /datadisk2/xuronghao/Projects/Basic/ckpt
     conditional: True
-
-LP:
-    num_high: 2
-    # Low-light，hdr：6
-    in_chans: 3
+VAE:
+    type: LP
+    LP:
+        num_high: 5 #/16
+        # Low-light，hdr：6
+        in_chans: 3
 
 model:
     in_channels: 3
@@ -40,6 +41,16 @@ model:
     ema: True
     resamp_with_conv: True
 
+DiT:
+    patch_size: 1
+    in_chans: 3
+    t_ch: 16
+    hidden_size: 256
+    depth: 6
+    num_heads: 4
+    mlp_ratio: 4.0
+    drop_rate: 0.0
+
 diffusion:
     beta_schedule: linear
     beta_start: 0.0001
@@ -47,10 +58,11 @@ diffusion:
     num_diffusion_timesteps: 200
 
 training:
+    # [per gpu]
     batch_size: 4 # 4-512-OOM
-    val_batch_size: 2
+    val_batch_size: 1
     n_epochs: 500
-    log_freq: 50
+    log_freq: 10
     validation_freq: 1000
 
 optim:
@@ -62,13 +74,19 @@ optim:
     step_size: 50
     gamma: 0.8
 
+accelerator: 
+    mixed_precision: fp16 # "no", "fp16", "bf16"
+    gradient_accumulation_steps: 2 # 表示每 4 个 batch 才更新一次。
+
 loss:
-    photo_loss_w: 0.0
-    noise_loss_w: 1.0
-    frequency_loss_w: 1.0
+    photo_loss_w: 1.0 # gt_img vs pred_img
+    ssim_loss_w: 1.0
+    noise_loss_w: 1.0 # diffsuion
+    pred_loss_w: 1.0 # 隐空间
 
+    frequency_loss_w: 1.0 # 隐空间
 
-DEBUG: False #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件
+DEBUG: True #True：debug模式，不保存任何日志和模型文件；False：保存日志和模型文件
 
 wandb:
     is_use_wandb: True
@@ -80,3 +98,7 @@ wandb:
     ### entity
     ###### project
     ######## name
+###
+###    data_dict["pred"] = denoise_high ## 隐空间扩散量
+###    data_dict["noise_output"] = noise_output ## 隐空间噪声
+###    data_dict["e"] = e

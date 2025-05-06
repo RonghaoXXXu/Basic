@@ -25,7 +25,7 @@ class IRdataset:
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.config.training.batch_size,
                                                    shuffle=True, num_workers=self.config.data.num_workers,
                                                    pin_memory=True)
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=False,
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=self.config.training.val_batch_size, shuffle=False,
                                                  num_workers=self.config.data.num_workers,
                                                  pin_memory=True)
 

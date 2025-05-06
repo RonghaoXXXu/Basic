@@ -7,11 +7,22 @@ CONFIG=$3
 # python -m torch.distributed.launch
 export CUDA_VISIBLE_DEVICES=$CUDA_DEVICES
 export OMP_NUM_THREADS=4
+export WANDB_SILENT=true
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 # --master_port=25461
-torchrun --nproc_per_node=$NUM_GPUS $PROJECT_ROOT/train.py \
+# torchrun --nproc_per_node=$NUM_GPUS $PROJECT_ROOT/train.py \
+#     --config $CONFIG \
+#     --seed 2025 \
+#     --sampling_timesteps 10 
+# Acc
+accelerate launch \
+    --num_processes=$NUM_GPUS \
+    --num_machines=1 \
+    --mixed_precision=fp16 \
+    --dynamo_backend=no\
+    $PROJECT_ROOT/train.py \
     --config $CONFIG \
     --seed 2025 \
-    --sampling_timesteps 10 
+    --sampling_timesteps 10

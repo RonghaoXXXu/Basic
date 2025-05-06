@@ -8,6 +8,7 @@ import numpy as np
 import datasets
 import models
 import torch.distributed as dist
+from omegaconf import OmegaConf
 
 def parse_args_and_config_ddp():
     parser = argparse.ArgumentParser(description='Training Wavelet-Based Diffusion Model with DDP')
@@ -30,8 +31,10 @@ def parse_args_and_config_ddp():
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-    new_config = dict2namespace(config)
+        # config = yaml.safe_load(f)
+        config = OmegaConf.load(f) # namepace
+        dict_config = OmegaConf.to_container(config, resolve=True) # dict
+    # new_config = dict2namespace(config)
     
     # if args.local_rank == 0 and new_config.wandb.is_use_wandb:
     #     os.environ["WANDB_API_KEY"] = new_config.wandb.APIkeys 
@@ -59,7 +62,7 @@ def parse_args_and_config_ddp():
                             rank=args.rank)
     dist.barrier()  # 等待所有进程都初始化完毕，即所有GPU都要运行到这一步以后在继续
 
-    return args, new_config, config
+    return args, config, dict_config
 
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description='Training Wavelet-Based Diffusion Model')
@@ -75,11 +78,11 @@ def parse_args_and_config():
                         help='Seed for initializing training (default: 230)')
     args = parser.parse_args()
 
-    with open(os.path.join("configs", args.config), "r") as f:
+    with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     new_config = dict2namespace(config)
 
-    return args, new_config
+    return args, new_config, config
 
 def dict2namespace(config):
     namespace = argparse.Namespace()
@@ -93,7 +96,7 @@ def dict2namespace(config):
 
 
 def main():
-    args, config = parse_args_and_config()
+    args, config, _ = parse_args_and_config()
 
     # setup device to run
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -136,5 +139,25 @@ def main_DDP():
     model = models.__dict__[configs.model_name](configs=configs, args=args, ddp=True)
     model.train(train_loader, val_loader, train_sampler, dict_configs)
 
+def main_accel():
+    args, config, dict_config = parse_args_and_config()
+
+    # set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.benchmark = True
+
+    # data loading
+    # print("=> using dataset '{}'".format(config.data.type))
+    DATASET = datasets.__dict__[config.data.type](config)
+    train_loader, val_loader = DATASET.get_loaders()
+
+    # create model
+    # print("=> creating denoising-diffusion model...")
+    diffusion = models.__dict__[config.model_name](args=args, configs=config, use_ddp=False, use_accelerate=True)
+    diffusion.train_accel(train_loader, val_loader, dict_config)
+
 if __name__ == "__main__":
-    main_DDP()
+    main_accel()

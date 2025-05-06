@@ -1,14 +1,16 @@
 import argparse
 import datetime
 import json
-import re
+from PIL import Image
 import time, os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 import cv2
 import torch.nn.functional as F
 from models.unet import DiffusionUNet
+from models.dit import DiT
 from models.wavelet import DWT, IWT
 from pytorch_msssim import ssim
 from models.mods import HFRM
@@ -17,6 +19,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from utils.optimize import get_optimizer
 import wandb
 from tqdm import tqdm
+from accelerate import Accelerator
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.metrics import structural_similarity as compare_ssim
 
 def check_size(x):
     _, _, img_h, img_w = x.shape
@@ -41,6 +46,27 @@ def data_transform(X):
 def inverse_data_transform(X):
     return torch.clamp((X + 1.0) / 2.0, 0.0, 1.0)
 
+def requires_grad(model, flag=True):
+    """
+    Set requires_grad flag for all parameters in a model.
+    """
+    for p in model.parameters():
+        p.requires_grad = flag
+
+def detach_tensors(tensors):
+    result = []
+    for t in tensors:
+        if isinstance(t, tuple):
+            # 如果是 tuple，对每个元素递归 detach
+            new_t = tuple(ti.detach() if torch.is_tensor(ti) else ti for ti in t)
+            result.append(new_t)
+        elif torch.is_tensor(t):
+            # 如果是 tensor，直接 detach
+            result.append(t.detach())
+        else:
+            # 其他类型保持不变
+            result.append(t)
+    return result
 
 # 衡量图像在空间上的梯度变化
 class TVLoss(nn.Module):
@@ -65,34 +91,43 @@ class TVLoss(nn.Module):
 
 
 class EMAHelper(object):
-    # shadow_param = (1 − μ)⋅current_param + μ⋅shadow_param
-    # 帮助生成更稳定的模型权重，提升模型的泛化能力和鲁棒性。
     def __init__(self, mu=0.9999):
         self.mu = mu
         self.shadow = {}
 
     def register(self, module):
+        """将模型参数拷贝到 shadow 字典中，并保持设备一致"""
         if isinstance(module, nn.DataParallel) or isinstance(module, nn.parallel.DistributedDataParallel):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                # 确保克隆参数在相同设备上
+                self.shadow[name] = param.data.clone().to(param.device)
 
     def update(self, module):
+        """用当前模型参数更新 shadow 参数"""
         if isinstance(module, nn.DataParallel) or isinstance(module, nn.parallel.DistributedDataParallel):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
+                # 如果影子参数不在当前设备上，先移动过去
+                if self.shadow[name].device != param.device:
+                    self.shadow[name] = self.shadow[name].to(param.device)
+                # 更新影子参数
                 self.shadow[name].data = (1. - self.mu) * param.data + self.mu * self.shadow[name].data
 
     def ema(self, module):
+        """将 shadow 参数加载回模型"""
         if isinstance(module, nn.DataParallel) or isinstance(module, nn.parallel.DistributedDataParallel):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
+                if self.shadow[name].device != param.device:
+                    self.shadow[name] = self.shadow[name].to(param.device)
                 param.data.copy_(self.shadow[name].data)
 
     def ema_copy(self, module):
+        """创建一个副本并应用 EMA 参数"""
         if isinstance(module, nn.DataParallel):
             inner_module = module.module
             module_copy = type(inner_module)(inner_module.config).to(inner_module.config.device)
@@ -106,6 +141,7 @@ class EMAHelper(object):
         else:
             module_copy = type(module)(module.config).to(module.config.device)
             module_copy.load_state_dict(module.state_dict())
+
         self.ema(module_copy)
         return module_copy
 
@@ -147,7 +183,39 @@ class Lap_Pyramid_Conv(nn.Module):
         self.num_high = num_high
         self.channels = in_chans
         self.kernel = nn.Parameter(self.gauss_kernel(channels=self.channels), requires_grad=False)
-        
+        # self.conv_LL_LL = nn.Sequential(
+        #     nn.Conv2d(3, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 3, 3, 1, 1)
+        # )
+        # self.conv_LL = nn.Sequential(
+        #     nn.Conv2d(3, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 16, 3, 1, 1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(16, 3, 3, 1, 1)
+        # )
+
+        # self.init_weights(self.conv_LL_LL)
+        # self.init_weights(self.conv_LL)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            # 使用 Kaiming 初始化，适用于 LeakyReLU(negative_slope=0.2)
+            init.kaiming_normal_(m.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
+            if m.bias is not None:
+                init.constant_(m.bias, 0)
+
     def gauss_kernel(self, channels=3):
         kernel = torch.tensor([[1., 4., 6., 4., 1],
                                [4., 16., 24., 16., 4.],
@@ -224,19 +292,24 @@ class Lap_Pyramid_Conv(nn.Module):
             current = down
         pyr.append(current)
         return pyr
-
-    def pyramid_recons(self, pyr):
+    # pyramid_recons
+    def forward(self, pyr):
         image = pyr[-1] # pyr=[h_0^hat, h_1^hat, h_2^hat, I_3^hat]
         # print("***********************")
         # print(image.size())
         # print(len(pyr[:-1]))
-        for level in reversed(pyr[:-1]):
+        for i, level in enumerate(reversed(pyr[:-1])):
             # https://www.jianshu.com/p/e7de4cd92f68
             up = self.upsample(image)
             # if up.shape[2] != level.shape[2] or up.shape[3] != level.shape[3]:
             if up.shape != level.shape:
                 # up = nn.functional.interpolate(up, size=(level.shape[2], level.shape[3]))
                 up = F.interpolate(up, size=(level.shape[2], level.shape[3]))
+            # if i == len(pyr[:-1]) - 2:
+            #     image = self.conv_LL_LL(up) + level
+            # elif i == len(pyr[:-1]) - 1:
+            #     image = self.conv_LL(up) + level
+            # else:
             image = up + level
         return image
 
@@ -260,38 +333,7 @@ class Net(nn.Module):
         self.args = args
         self.config = config
 
-        self.lp = Lap_Pyramid_Conv(num_high=config.LP.num_high, in_chans=config.LP.in_chans)
-        # self.conv_LL_LL = nn.Sequential(
-        #     nn.Conv2d(6, 6, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(6, 6, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(6, 3, 3, 1, 1)
-        # )
-        # self.conv_LL = nn.Sequential(
-        #     nn.Conv2d(6, 6, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(6, 6, 3, 1, 1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(6, 3, 3, 1, 1)
-        # )
-        # self.final_conv = nn.Conv2d(3, 3, 3, 1, 1)
-
-        # num_in_ch = config.hdrvit.in_chans
-        # num_out_ch = config.hdrvit.out_chans
-        # ################################### 1. Feature Extraction Network ###################################
-        # # coarse feature
-        # self.conv_f1 = nn.Conv2d(num_in_ch, config.hdrvit.embed_dim, 3, 1, 1)
-        # self.conv_f2 = nn.Conv2d(num_in_ch, config.hdrvit.embed_dim, 3, 1, 1)
-        # self.conv_f3 = nn.Conv2d(num_in_ch, config.hdrvit.embed_dim, 3, 1, 1)
-        # # spatial attention module
-        # self.att_module_l = SpatialAttentionModule(config.hdrvit.embed_dim)
-        # self.att_module_h = SpatialAttentionModule(config.hdrvit.embed_dim)
-        # self.conv_first = nn.Conv2d(config.hdrvit.embed_dim * 3, num_out_ch, 3, 1, 1)
-        ####################################################################################################
-        self.high_enhance0 = HFRM(in_channels=3, out_channels=64)
-        self.high_enhance1 = HFRM(in_channels=3, out_channels=64)
-        self.Unet = DiffusionUNet(config)
+        self.Unet = DiT(config)
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -336,56 +378,30 @@ class Net(nn.Module):
 
         return xs[-1]
     
-    def recon(self, input_lp, denoise_high, x):
-        assert (input_lp[1][0].shape == denoise_high.shape), print("input_lp[1][0].shape != denoise_high.shape")
-        
-        # cat(input_LL_LL, denoise_high1)
-        # up -> LL
-        # cat(input_high0, LL)
-        # conv3
-        
-        input_high0, input_LL = input_lp[0]
-        input_high1, input_LL_LL = input_lp[1]
-        input_down =  input_lp[-1]
-        # input_denoise_LL_LL = torch.cat([input_LL_LL, denoise_high], dim=1)
-        # pred_LL = input_LL_LL + denoise_high
-        # pred_LL += input_LL_LL
-
-        # pred_LL = F.interpolate(pred_LL, scale_factor=2, mode='bicubic', align_corners=False)
-        
-        # pred_x = torch.cat([input_high0, pred_LL], dim=1)
-
-        pred_x = self.lp.pyramid_recons([input_high0, denoise_high, input_down])
-
-        # pred_x = self.conv_LL(pred_x)
-        # pred_x += self.final_conv(x)
-
-        return pred_x, None
-
-    def forward(self, x, label):
+    # 隐空间扩散
+    def forward(self, x, gt):
         data_dict = {}
         ########################
-        input_lp = self.lp.pyramid_decom(x)
-        input_high0, input_LL = input_lp[0]
-        input_high1, input_LL_LL = input_lp[1] 
+        # input_lp = self.lp.pyramid_decom(x)
+        input_high = x
         ########################
-        b = self.betas.to(x.device)
+        b = self.betas.to(input_high.device)
 
         # 对称时间步序列：结合了随机采样和对称补集的优点，能够覆盖正向和反向扩散的不同阶段
-        t = torch.randint(low=0, high=self.num_timesteps, size=(input_high1.shape[0] // 2 + 1,)).to(x.device)
-        t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:input_high1.shape[0]].to(x.device)
+        t = torch.randint(low=0, high=self.num_timesteps, size=(input_high.shape[0] // 2 + 1,)).to(input_high.device)
+        t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:input_high.shape[0]].to(input_high.device)
         a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
 
-        e = torch.randn_like(input_high1)
+        e = torch.randn_like(input_high)
 
         if self.training:
-            gt_lp= self.lp.pyramid_decom(label)
-            gt_high0, gt_LL = gt_lp[0]
-            gt_high1, gt_LL_LL = gt_lp[1]  
+            # gt_lp= self.lp.pyramid_decom(label)
+            # gt_high0, gt_LL = gt_lp[0]
+            gt_high = gt
 
-            xet = gt_high1 * a.sqrt() + e * (1.0 - a).sqrt()
-            noise_output = self.Unet(torch.cat([input_high1, xet], dim=1), t.float())
-            denoise_high1 = self.sample_training(input_high1, b)
+            xet = gt_high * a.sqrt() + e * (1.0 - a).sqrt()
+            noise_output = self.Unet(torch.cat([input_high, xet], dim=1), t.float())
+            denoise_high = self.sample_training(input_high, b)
 
             # cat(input_LL_LL, denoise_high1)
             # up -> LL
@@ -393,38 +409,50 @@ class Net(nn.Module):
             # conv3
             #
             # denoise_high1 = inverse_data_transform(denoise_high1)
-            pred_x, pred_LL = self.recon(input_lp, denoise_high1, x)
+            # pred_x, pred_LL = self.recon(input_lp, denoise_high1)
             # cl_pred_x = torch.clamp(pred_x, min=0, max=1)
 
-            data_dict["input_lp"] = input_lp               
-            data_dict["gt_lp"] = gt_lp
-            data_dict["pred_high1"] = denoise_high1
-
+            # data_dict["input_lp"] = input_lp               
+            # data_dict["gt_lp"] = gt_lp
+            data_dict["pred"] = denoise_high
             data_dict["noise_output"] = noise_output
-            data_dict["pred_x"] = pred_x
-            data_dict["pred_LL"] = pred_LL
-            data_dict["gt"] = label 
             data_dict["e"] = e
 
         else:
             # label 随意填充为 zeros_like(input_img) 
-            denoise_high1 = self.sample_training(input_high1, b)
-            pred_x, _ = self.recon(input_lp, denoise_high1, x)
+            denoise_high = self.sample_training(input_high, b)
+            # pred_x, _ = self.recon(input_lp, denoise_high1)
             # cl_pred_x = torch.clamp(pred_x, min=0, max=1)
-            data_dict["pred_x"] = pred_x
+            data_dict["pred"] = denoise_high
 
         return data_dict
     
 class LL_DDM(nn.Module):
-    def __init__(self, configs, args, ddp=True):
+    def __init__(self, configs, args, use_ddp=True, use_accelerate=True):
         super().__init__()
         self.configs = configs
         self.args = args
         self.model = Net(config=configs, args=args)
-        if ddp:
+        if use_ddp:
             self.model = DDP(self.model.to(self.args.gpu), 
                             device_ids=[self.args.gpu],
                             find_unused_parameters=True)
+        if use_accelerate:
+            self.accelerator = Accelerator(
+                mixed_precision=self.configs.accelerator.mixed_precision,
+                gradient_accumulation_steps=self.configs.accelerator.gradient_accumulation_steps,
+                log_with="wandb" if self.configs.wandb.is_use_wandb else None
+            )
+            self.vae = Lap_Pyramid_Conv(num_high=configs.VAE.LP.num_high, \
+                in_chans=configs.VAE.LP.in_chans)
+            self.args.gpu = self.accelerator.device
+            if self.accelerator.use_distributed:
+                self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
+                self.vae = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.vae)
+            self.optimizer_vae, self.scheduler_vae = get_optimizer(self.configs, self.vae.parameters())
+            self.ema_helper_vae = EMAHelper()
+            self.ema_helper_vae.register(self.vae) 
+
         self.ema_helper = EMAHelper()
         self.ema_helper.register(self.model)
         #
@@ -432,6 +460,7 @@ class LL_DDM(nn.Module):
         self.l1_loss = torch.nn.L1Loss()
         self.TV_loss = TVLoss()
         self.optimizer, self.scheduler = get_optimizer(self.configs, self.model.parameters())
+
         #
         self.start_epoch, self.step = 0, 0
         # 
@@ -494,7 +523,6 @@ class LL_DDM(nn.Module):
             f"ssim-l: {np.mean(test_results['ssim_l']):.4f}")
 
     def train(self, train_loader, val_loader, train_sampler, dict_configs):
-        
         if self.args.gpu == 0:
             current_date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")  # 格式：YYYY-MM-DD
             date_dir = os.path.join(self.configs.data.ckpt_dir, 
@@ -603,7 +631,7 @@ class LL_DDM(nn.Module):
                             torch.save({
                                 #'step': self.step,
                                 #'epoch': epoch + 1,
-                                'state_dict': self.model.module.state_dict(),  # 保存 .module 的状态字典
+                                'state_dict': self.model.state_dict(),  # 保存 .module 的状态字典
                                 #'optimizer': self.optimizer.state_dict(),
                                 #'scheduler': self.scheduler.state_dict(),
                                 #'ema_helper': self.ema_helper.state_dict(),
@@ -621,7 +649,201 @@ class LL_DDM(nn.Module):
         
         wandb.finish()
         self.find_best_model(date_dir)
+    
+    def train_accel(self, train_loader, val_loader, dict_configs):
+        """
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=per_gpu_batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                drop_last=True
+            )
+        """
+        if self.accelerator.is_main_process:
+            current_date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")  # 格式：YYYY-MM-DD
+            date_dir = os.path.join(self.configs.data.ckpt_dir, 
+                                self.configs.work_name + "_" + current_date)
+            
+            if not self.configs.DEBUG:
+                os.makedirs(date_dir, exist_ok=True) 
+            
+            self.log_file = os.path.join(date_dir, "train_log.txt")
+            self.save_log(self.log_file, dict_configs, indent=4)
+            if self.configs.wandb.is_use_wandb:
+                os.environ["WANDB_API_KEY"] = self.configs.wandb.APIkeys
+                self.accelerator.init_trackers(
+                    project_name=self.configs.work_name,
+                    config=dict_configs,
+                    init_kwargs={"wandb": {"entity": self.configs.wandb.entity, \
+                                        "name": f"{self.accelerator.num_processes}GPUs" + \
+                                        f"_{self.configs.training.batch_size}Batch_" + current_date}}
+                )
+            print(
+                f"""
+                ╔{'═' * 60}╗
+                ║ {'Training:':<15} {self.configs.work_name:<43}║
+                ║ {'Model Name:':<15} {self.configs.model_name:<43}║
+                ║ {'Data Name:':<15} {self.configs.data.name:<43}║
+                ║ {'Data Type:':<15} {self.configs.data.type:<43}║
+                ╚{'═' * 60}╝
+                """
+            )
         
+        self.model, self.vae, self.optimize, self.scheduler, self.optimizer_vae, self.scheduler_vae, train_loader, val_loader = \
+            self.accelerator.prepare(self.model, self.vae, self.optimizer, self.scheduler, self.optimizer_vae, self.scheduler_vae, train_loader, val_loader) 
+
+        for epoch in range(self.configs.training.n_epochs):
+            self.model.train()
+            for data_dict in tqdm(train_loader, disable=not self.accelerator.is_main_process, \
+                    leave=False, desc=f"Epoch {epoch + 1}: ", total=len(train_loader)):
+                x = data_dict[0]
+                # x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
+                x_cond = x[:, :3, :, :]
+                y = x[:, 3:, :, :]
+
+                # x_cond, imgh, imgw = check_size(x_cond)
+                # y, _, _ = check_size(y)
+
+                self.step += 1
+                # 隐空间压缩
+                with self.accelerator.accumulate([self.model, self.vae]), self.accelerator.autocast():
+                    un_warp_vae = self.accelerator.unwrap_model(self.vae)
+                    x_cond_lp = un_warp_vae.pyramid_decom(x_cond)
+                    y_lp = un_warp_vae.pyramid_decom(y)
+
+                    input_high, gt_high = x_cond_lp[-2][0], y_lp[-2][0]
+                    output = self.model(input_high, gt_high)
+                    noise_loss, pred_loss = self.l2_loss(output["noise_output"], output["e"]), self.l1_loss(output["pred"], y_lp[-2][0])
+                    loss_df = self.configs.loss.noise_loss_w * noise_loss + \
+                                self.configs.loss.pred_loss_w * pred_loss
+                                        
+                    # self.accelerator.backward(loss_df)
+                    # self.optimize.step()
+                    # self.optimize.zero_grad(set_to_none=True)
+
+                    # requires_grad(self.model, False)
+                    # with torch.no_grad():
+                    #     output_ = self.model(x_cond_lp[-2][0], y_lp[-2][0])
+
+                    x_cond_pred_list = [it[0] for it in x_cond_lp[:-2]] + [output["pred"], x_cond_lp[-1]]
+
+                    pred_x = self.vae(x_cond_pred_list)
+                    photo_loss, ssim_loss = self.l1_loss(pred_x, y), (1 - ssim(pred_x, y, data_range=1.0))
+                    loss_vae = self.configs.loss.photo_loss_w * photo_loss + \
+                                self.configs.loss.ssim_loss_w * ssim_loss
+                    
+                    self.accelerator.backward(loss_df)
+                    # if self.accelerator.sync_gradients:
+                    #     self.accelerator.clip_grad_norm_(self.vae.parameters(), 1.0)
+                    self.optimize.step()
+                    self.optimize.zero_grad(set_to_none=True)
+                    # self.optimizer_vae.step()  
+                    # self.optimizer_vae.zero_grad(set_to_none=True)
+                    
+                    # requires_grad(self.model, True)
+                    # self.model.train()
+
+                    if self.step % self.configs.training.log_freq == 0 and self.accelerator.is_main_process and self.step!= 0:
+                        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        tqdm.write(
+                            f"[{current_time}] "
+                            f"Epoch {epoch + 1}: step {self.step} | "
+                            f"noise_loss: {noise_loss.item():.4f} | "
+                            f"pred_z_loss: {pred_loss.item():.4f} | "
+                            f"photo_loss: {photo_loss.item():.4f} | "
+                            f"ssim_loss: {ssim_loss.item():.4f} | "
+                            f"loss_diffusion: {loss_df.item():.4f} | "
+                            f"loss_vae: {loss_vae.item():.4f}"
+                        )
+
+                        self.accelerator.log({
+                            "noise_loss": noise_loss.item(),
+                            "pred_z_loss": pred_loss.item(),
+                            "photo_loss": photo_loss.item(),
+                            "ssim_loss": ssim_loss.item(),
+                            "loss_diffusion": loss_df.item(),
+                            "loss_vae": loss_vae.item(),
+                            "step": self.step,
+                            "epoch": epoch
+                        }, step=self.step)
+                        
+                        self.ema_helper.update(self.accelerator.unwrap_model(self.model))
+                        self.ema_helper_vae.update(self.accelerator.unwrap_model(self.vae))
+
+                    if self.step % self.configs.training.validation_freq == 0 and self.step!= 0:
+                        # 切换到评估模式
+                        self.model.eval()
+                        self.vae.eval()
+                        # 验证集采样（仅主进程）
+                        if self.accelerator.is_main_process:
+                            ssims, psnrs = [], []
+                            val_pred_x = None
+                            val_y = None
+                            val_pred_z = None
+                            for val_x in tqdm(val_loader, total=len(val_loader), desc="Validation", disable=not self.accelerator.is_local_main_process):
+                                x = val_x[0]
+                                with torch.no_grad():
+                                    val_x_cond = x[:, :3, :, :]
+                                    val_y = x[:, 3:, :, :]
+                                    un_warp_vae = self.accelerator.unwrap_model(self.vae)
+                                    val_x_cond_lp = un_warp_vae.pyramid_decom(val_x_cond)
+
+                                    val_input_high = val_x_cond_lp[-2][0]
+                                    val_output = self.model(val_input_high, None)
+
+                                    val_pred_z = val_output["pred"]
+                                    val_x_cond_pred_list = [it[0] for it in val_x_cond_lp[:-2]] + [val_output["pred"], val_x_cond_lp[-1]]
+                                    val_pred_x = self.vae(val_x_cond_pred_list)
+                                    val_pred_x = torch.clamp(val_pred_x, min=0, max=1)
+                                    
+                                    # RGB
+                                    val_pred_x = torch.squeeze(val_pred_x.detach()).cpu().numpy().transpose(1, 2, 0)
+                                    val_y = torch.squeeze(val_y.detach()).cpu().numpy().transpose(1, 2, 0)
+
+                                    ssim_ = compare_ssim(val_pred_x, val_y, multichannel=True, channel_axis=2, data_range=1.0)
+                                    psnr_ = compare_psnr(val_pred_x, val_y)
+
+                                    ssims.append(ssim_)
+                                    psnrs.append(psnr_)
+                            
+                            self.accelerator.log({
+                                "val_ssim": np.mean(ssims),
+                                "val_psnr": np.mean(psnrs),
+                                "step": self.step,
+                                "epoch": epoch
+                            }, step=self.step)
+
+                            val_pred_x = (val_pred_x * 255).astype(np.uint8)
+                            val_y = (val_y * 255).astype(np.uint8)
+                            val_pred_z = torch.squeeze(val_pred_z.detach()).cpu().numpy().transpose(1, 2, 0)
+                            val_pred_z = (val_pred_z * 255).astype(np.uint8)
+
+                            self.accelerator.log({
+                                "Deblur Image" : wandb.Image(Image.fromarray(val_pred_x, mode="RGB"), caption="val_pred_x"),
+                                "Deblur Image (z)" : wandb.Image(Image.fromarray(val_pred_z, mode="RGB"), caption="val_pred_z")
+                                #"GT Image" : wandb.Image(Image.fromarray(val_y, mode="RGB"), caption="val_y")
+                            })
+
+                            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            tqdm.write(
+                                f"[{current_time}] "
+                                f"Epoch {epoch + 1}| "
+                                f"val_ssim: {np.mean(ssims):.4f} | "
+                                f"val_psnr: {np.mean(psnrs):.4f}"
+                            )
+
+                        # 切换回训练模式
+                        self.model.train()
+                        self.vae.train()
+
+
+            self.scheduler.step()
+            self.scheduler_vae.step()     
+                    
+
+    
     def estimation_loss(self, x, output):
 
         input_high0, input_high1, gt_high0, gt_high1 = output["input_high0"], output["input_high1"],\
@@ -725,7 +947,7 @@ class LL_DDM(nn.Module):
             for b in range(pred_x_tensor.shape[0]):  # 遍历batch维度
                 pred_x = torch.squeeze(pred_x_tensor[b].detach().cpu()).numpy().astype(np.float32)
                 save_pred_img = (pred_x * 255).astype(np.uint8)
-                save_pred_img = cv2.cvtColor(save_pred_img.transpose(1, 2, 0), cv2.COLOR_BGR2RGB)
+                save_pred_img = cv2.cvtColor(save_pred_img.transpose(1, 2, 0), cv2.COLOR_RGB2BGR)
 
                 # 保存/记录图像（每20个batch保存一次）
                 # if not self.configs.DEBUG and i % 20 == 0:
@@ -733,7 +955,7 @@ class LL_DDM(nn.Module):
                 
                 _y = torch.squeeze(y[b].detach().cpu()).numpy().astype(np.float32)
                 save_pred_gt = (_y * 255).astype(np.uint8)
-                save_pred_gt = cv2.cvtColor(save_pred_gt.transpose(1, 2, 0), cv2.COLOR_BGR2RGB)
+                save_pred_gt = cv2.cvtColor(save_pred_gt.transpose(1, 2, 0), cv2.COLOR_RGB2BGR)
                 
                 # if self.configs.wandb.is_use_wandb and i % 20 == 0:
                 #     wandb.log({
