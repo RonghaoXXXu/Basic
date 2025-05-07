@@ -76,11 +76,14 @@ def parse_args_and_config():
                         help="Location to save restored validation image patches")
     parser.add_argument('--seed', default=230, type=int, metavar='N',
                         help='Seed for initializing training (default: 230)')
+    # parser.add_argument('--wandb', action='store_true')
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     new_config = dict2namespace(config)
+    # new_config.wandb.is_use_wandb = args.wandb
+    # config["wandb"]["is_use_wandb"] = args.wandb
 
     return args, new_config, config
 

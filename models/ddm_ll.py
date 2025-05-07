@@ -190,6 +190,11 @@ class Lap_Pyramid_Conv(nn.Module):
         # 3 -> 16
         self.conv_x = nn.Conv2d(self.channels, self.embed_dim, 3, 1, 1)
         self.conv_f = nn.Conv2d(self.embed_dim, self.channels, 3, 1, 1)
+        self.conv_after_body = nn.Sequential(nn.Conv2d(self.channels, self.channels * 4, 3, 1, 1),
+                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                                 nn.Conv2d(self.channels * 4, self.channels * 4, 1, 1, 0),
+                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                                 nn.Conv2d(self.channels * 4, self.channels, 3, 1, 1))
 
         self.channel_attention = nn.ModuleList(
             [RCAB(n_feat=2*self.embed_dim if i <self.num_high else self.embed_dim, reduction=2)
@@ -350,7 +355,12 @@ class Lap_Pyramid_Conv(nn.Module):
         pyr_result.append(pyr_low)
         # self.pyramid_recons(pyr_result)
         r = self.pyramid_recons(pyr_result)
-        return x + self.conv_f(r)
+        # B 16 H W
+        chunks = torch.chunk(r, chunks=3, dim=1)
+        # 对每个 chunk 在通道维度求均值，并保持通道维度
+        means = [chunk.mean(dim=1, keepdim=True) for chunk in chunks]
+        # 拼接起来
+        return torch.cat(means, dim=1)  # (B, 3, H, W)
 
 
 class SpatialAttentionModule(nn.Module):
@@ -516,6 +526,7 @@ class DDM(nn.Module):
         # 
         self.model_sam = []
         self.log_file = None
+        self.best_psnr = 0
     
     def load_ddm_ckpt(self, load_path, ema=False):
         checkpoint = torch.load(load_path, map_location=None)
@@ -833,6 +844,7 @@ class DDM(nn.Module):
                                     val_pred_z = val_output["pred"]
                                     val_pred_x = val_output["pred_x"][:, :, :imgh, :imgw]
                                     val_pred_x = torch.clamp(val_pred_x, min=0, max=1)
+                                    val_y = val_y[:, :, :imgh, :imgw]
                                     
                                     # RGB
                                     val_pred_x = torch.squeeze(val_pred_x.detach()).cpu().numpy().transpose(1, 2, 0)
@@ -843,24 +855,25 @@ class DDM(nn.Module):
 
                                     ssims.append(ssim_)
                                     psnrs.append(psnr_)
-                            
-                            self.accelerator.log({
-                                "val_ssim": np.mean(ssims),
-                                "val_psnr": np.mean(psnrs),
-                                "step": self.step,
-                                "epoch": epoch
-                            }, step=self.step)
 
                             val_pred_x = (val_pred_x * 255).astype(np.uint8)
                             val_y = (val_y * 255).astype(np.uint8)
-                            val_pred_z = torch.squeeze(val_pred_z.detach()).cpu().numpy().transpose(1, 2, 0)
-                            val_pred_z = (val_pred_z * 255).astype(np.uint8)
+                            # val_pred_z = torch.squeeze(val_pred_z.detach()).cpu().numpy().transpose(1, 2, 0)
+                            # val_pred_z = (val_pred_z * 255).astype(np.uint8)
+                            
+                            if self.configs.wandb.is_use_wandb:
+                                self.accelerator.log({
+                                    "val_ssim": np.mean(ssims),
+                                    "val_psnr": np.mean(psnrs),
+                                    "step": self.step,
+                                    "epoch": epoch
+                                }, step=self.step)
 
-                            self.accelerator.log({
-                                "Deblur Image" : wandb.Image(Image.fromarray(val_pred_x, mode="RGB"), caption="val_pred_x"),
-                                "Deblur Image (z)" : wandb.Image(Image.fromarray(val_pred_z, mode="RGB"), caption="val_pred_z")
-                                #"GT Image" : wandb.Image(Image.fromarray(val_y, mode="RGB"), caption="val_y")
-                            })
+                                self.accelerator.log({
+                                    "Deblur Image" : wandb.Image(Image.fromarray(val_pred_x, mode="RGB"), caption="val_pred_x"),
+                                    # "Deblur Image (z)" : wandb.Image(Image.fromarray(val_pred_z, mode="RGB"), caption="val_pred_z"),
+                                    "GT Image" : wandb.Image(Image.fromarray(val_y, mode="RGB"), caption="val_y")
+                                })
 
                             current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             tqdm.write(
@@ -869,6 +882,24 @@ class DDM(nn.Module):
                                 f"val_ssim: {np.mean(ssims):.4f} | "
                                 f"val_psnr: {np.mean(psnrs):.4f}"
                             )
+
+                            if np.mean(psnrs) > self.best_psnr:
+                                self.best_psnr = np.mean(psnrs)
+
+                                # 获取当前 wandb run 的本地目录（例如：'wandb/run-xxxxx'）
+                                run_dir = wandb.run.dir
+
+                                # 保存路径（直接放在 wandb/run-xxx 下）
+                                save_file_path = os.path.join(run_dir, "pth")
+                                os.makedirs(save_file_path, exist_ok=True)
+
+                                torch.save({
+                                    'step': self.step,
+                                    'state_dict': self.accelerator.unwrap_model(self.model).state_dict(),
+                                    'best_psnr': self.best_psnr,
+                                    'config': self.configs,
+                                    'arg': self.args
+                                }, os.path.join(save_file_path, "best_model.pth"))
 
                         # 切换回训练模式
                         self.model.train()
